@@ -9,6 +9,7 @@ import net.minecraft.client.util.InputUtil;
 import net.minecraft.enchantment.Enchantment;
 import net.minecraft.enchantment.EnchantmentHelper;
 import net.minecraft.enchantment.Enchantments;
+import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Items;
 import net.minecraft.item.ItemStack;
@@ -91,7 +92,7 @@ public class ViewModelMod implements ClientModInitializer {
             target = findTightTarget(mc, p);
             if (target == null) return;
 
-            origin = p.getPos();
+            origin = pos(p);
             prevSlot = p.getInventory().getSelectedSlot();
             timer = 0;
             lastDist = 999;
@@ -131,7 +132,6 @@ public class ViewModelMod implements ClientModInitializer {
                 state = State.APPROACH;
             }
             case APPROACH -> {
-                // Hitbox'a eristik: havadayken hemen yer degistirme hareketini yap
                 if (canReach(p, target)) {
                     targetCell = target.getBlockPos();
                     pushDir = findPushDir(mc, targetCell, p);
@@ -144,7 +144,6 @@ public class ViewModelMod implements ClientModInitializer {
                     if (lastDist - dist < 0.8) { finish(p); return; }
                     lastDist = dist;
                 }
-                // Rakip bizden alcaktaysa suzulurken hafifce asagi in
                 if (!p.isOnGround() && target.getY() < p.getY()) {
                     p.addVelocity(0, -0.06, 0);
                 }
@@ -154,8 +153,8 @@ public class ViewModelMod implements ClientModInitializer {
                 int best = findBestSweepingSlot(mc, p);
                 if (best >= 0) p.getInventory().setSelectedSlot(best);
 
-                Vec3d back = pushDir != null ? pushDir : origin.subtract(p.getPos());
-                if (back.horizontalLength() < 0.5) back = target.getPos().subtract(p.getPos());
+                Vec3d back = pushDir != null ? pushDir : origin.subtract(pos(p));
+                if (back.horizontalLength() < 0.5) back = pos(target).subtract(pos(p));
                 float yaw = (float) (Math.toDegrees(Math.atan2(-back.x, back.z)));
                 float pitch = 0f;
                 sendLook(p, yaw, pitch);
@@ -183,7 +182,6 @@ public class ViewModelMod implements ClientModInitializer {
 
     private void enterStep(ClientPlayerEntity p) {
         MinecraftClient mc = MinecraftClient.getInstance();
-        // Rakip hala hucredeyse ve erisimdeyse: gidene kadar tekrar vur
         if (target != null && target.isAlive() && hits < MAX_HITS
                 && target.getBlockPos().equals(targetCell) && canReach(p, target)) {
             state = State.STRIKE;
@@ -193,10 +191,9 @@ public class ViewModelMod implements ClientModInitializer {
             info("§6[⚔ ViewModel] §f1 blokluk alana gecildi, durdu.");
             finish(p); return;
         }
-        Vec3d d = Vec3d.ofBottomCenter(targetCell).subtract(p.getPos());
+        Vec3d d = Vec3d.ofBottomCenter(targetCell).subtract(pos(p));
         Vec3d v = new Vec3d(d.x, 0, d.z);
         if (v.lengthSquared() > 1.0E-4) v = v.normalize().multiply(0.45);
-        // Havadaysak hucrenin tabanina dogru da in
         double vy = p.isOnGround() ? p.getVelocity().y : Math.min(p.getVelocity().y, 0) - 0.1;
         p.setVelocity(v.x, vy, v.z);
     }
@@ -206,7 +203,6 @@ public class ViewModelMod implements ClientModInitializer {
         if (slot < 0) return;
         p.getInventory().setSelectedSlot(slot);
 
-        // Rakibin ayak hizasina nisan al: yorunge asagi dogru kivrilir
         Vec3d aim = new Vec3d(target.getX(), target.getY() + 0.3, target.getZ());
         Vec3d d = aim.subtract(p.getEyePos());
         float yaw = (float) Math.toDegrees(Math.atan2(-d.x, d.z));
@@ -243,7 +239,6 @@ public class ViewModelMod implements ClientModInitializer {
         return -1;
     }
 
-    /** Ayaktan yukari kac blok gecilebilir (hava veya orumcek agi). Kati blok = tavan. */
     private int headroom(MinecraftClient mc, BlockPos feet) {
         int n = 0;
         for (int i = 0; i < 3; i++) {
@@ -276,19 +271,18 @@ public class ViewModelMod implements ClientModInitializer {
             for (int i = 0; i <= 3; i++) {
                 if (mc.world.getBlockState(n.up(i)).isOf(net.minecraft.block.Blocks.COBWEB)) { web = true; break; }
             }
-            double dist = p.getPos().squaredDistanceTo(Vec3d.ofBottomCenter(n));
+            double dist = pos(p).squaredDistanceTo(Vec3d.ofBottomCenter(n));
             if ((web && !bestHasWeb) || (web == bestHasWeb && dist < bestDist)) {
                 bestDir = d; bestHasWeb = web; bestDist = dist;
             }
         }
         if (bestDir == null) {
-            Vec3d v = p.getPos().subtract(Vec3d.ofBottomCenter(cell));
+            Vec3d v = pos(p).subtract(Vec3d.ofBottomCenter(cell));
             return new Vec3d(v.x, 0, v.z).normalize();
         }
         return new Vec3d(bestDir.getOffsetX(), 0, bestDir.getOffsetZ());
     }
 
-    /** Gozden hedefin hitbox'ina en yakin noktaya mesafe. */
     private double reachDist(ClientPlayerEntity p, PlayerEntity t) {
         Vec3d e = p.getEyePos();
         Box b = t.getBoundingBox();
@@ -314,6 +308,10 @@ public class ViewModelMod implements ClientModInitializer {
     private void reset() {
         hits = 0; pushDir = null; targetCell = null;
         state = State.IDLE; target = null; prevSlot = -1; timer = 0;
+    }
+
+    private static Vec3d pos(Entity e) {
+        return new Vec3d(e.getX(), e.getY(), e.getZ());
     }
 
     private static void info(String s) {
