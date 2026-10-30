@@ -3,6 +3,7 @@ package com.example.viewmodel;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
+import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.util.InputUtil;
@@ -26,7 +27,7 @@ import net.minecraft.util.math.Vec3d;
 
 public class ViewModelMod implements ClientModInitializer {
 
-    enum State { IDLE, GLIDE_START, ROCKET, APPROACH, STRIKE, ENTER, LAND }
+    enum State { IDLE, PREP, APPROACH, ENTER_TIGHT, STRIKE }
 
     private static boolean enabled = false;
     private static int bindKey = InputUtil.GLFW_KEY_G;
@@ -34,26 +35,29 @@ public class ViewModelMod implements ClientModInitializer {
 
     private State state = State.IDLE;
     private PlayerEntity target;
-    private Vec3d origin;
     private int prevSlot = -1;
     private int timer = 0;
+    private int limit = 60;
     private int rocketCooldown = 0;
     private double lastDist = 999;
-    private Vec3d pushDir;
-    private BlockPos targetCell;
+    private BlockPos tightCell;
     private int cooldown = 0;
     private int hits = 0;
+    private int jumpPhase = 0;
 
     private int now = 0;
     private int swapTicks = 38;
-    private int swapStart = -1;
+    private int enterStart = 0;
     private int lastHit = -999;
-    private int limit = 40;
+
+    private int restoreSlot = -1;
+    private int restoreAt = 0;
 
     private static final double REACH = 3.0;
-    private static final int TIMEOUT = 40;
-    private static final int MAX_HITS = 40;
+    private static final int TIMEOUT = 60;
+    private static final int MAX_HITS = 4;
     private static final int HIT_INTERVAL = 5;
+    private static final int RESTORE_DELAY = 8;
 
     @Override
     public void onInitializeClient() {
@@ -72,7 +76,7 @@ public class ViewModelMod implements ClientModInitializer {
                     double sec = Double.parseDouble(a[2].replace(',', '.'));
                     sec = Math.max(0.5, Math.min(5.0, sec));
                     swapTicks = (int) Math.round(sec * 20);
-                    info("Yer degistirme suresi: " + sec + " sn (" + swapTicks + " tick)");
+                    info("1 bloga girme suresi: " + sec + " sn (" + swapTicks + " tick)");
                 } catch (Exception e) {
                     info("Gecersiz sure. Ornek: .viewmodel time 1.5");
                 }
@@ -95,66 +99,94 @@ public class ViewModelMod implements ClientModInitializer {
         ClientPlayerEntity p = mc.player;
         if (p == null || mc.world == null) return;
 
+        now++;
+
+        if (restoreSlot >= 0 && now >= restoreAt) {
+            if (p.getInventory().getSelectedSlot() != restoreSlot) {
+                p.getInventory().setSelectedSlot(restoreSlot);
+            }
+            restoreSlot = -1;
+        }
+
         boolean down = InputUtil.isKeyPressed(mc.getWindow(), bindKey);
         if (down && !keyWasDown && mc.currentScreen == null) toggle();
         keyWasDown = down;
 
         if (!enabled) return;
 
-        now++;
         if (cooldown > 0) cooldown--;
+        if (rocketCooldown > 0) rocketCooldown--;
 
         if (state == State.IDLE) {
-            if (cooldown > 0) return;
+            if (cooldown > 0 || restoreSlot >= 0) return;
             target = findTightTarget(mc, p);
             if (target == null) return;
 
-            origin = pos(p);
             prevSlot = p.getInventory().getSelectedSlot();
             timer = 0;
             limit = TIMEOUT;
-            swapStart = -1;
             lastDist = 999;
+            hits = 0;
+            jumpPhase = 0;
+            tightCell = null;
 
+            int ownHead = headroom(mc, p.getBlockPos());
             if (canReach(p, target)) {
-                targetCell = target.getBlockPos();
-                pushDir = findPushDir(mc, targetCell, p);
-                state = State.STRIKE;
-            } else {
-                if (headroom(mc, p.getBlockPos()) < 2) return;
-                if (p.getEquippedStack(net.minecraft.entity.EquipmentSlot.CHEST).getItem() != Items.ELYTRA) {
-                    info("Elytra takili degil."); prevSlot = -1; return;
+                if (ownHead == 1) {
+                    state = State.STRIKE;
+                    limit = 40;
+                } else {
+                    state = State.ENTER_TIGHT;
+                    enterStart = now;
+                    limit = swapTicks + 20;
                 }
-                if (findSlot(p, Items.FIREWORK_ROCKET) < 0) { info("Fisek yok."); prevSlot = -1; return; }
-                state = State.GLIDE_START;
+            } else {
+                if (ownHead < 2) { prevSlot = -1; return; }
+                if (p.getEquippedStack(net.minecraft.entity.EquipmentSlot.CHEST).getItem() != Items.ELYTRA) {
+                    info("Elytra takili degil."); prevSlot = -1; cooldown = 40; return;
+                }
+                if (findSlot(p, Items.FIREWORK_ROCKET) < 0) {
+                    info("Fisek yok."); prevSlot = -1; cooldown = 40; return;
+                }
+                state = State.PREP;
             }
         }
 
         if (target == null || !target.isAlive() || ++timer > limit) { finish(p); return; }
-        if (rocketCooldown > 0) rocketCooldown--;
 
         switch (state) {
-            case GLIDE_START -> {
-                mc.options.sneakKey.setPressed(true);
-                if (p.isOnGround()) {
+            case PREP -> {
+                // Space, havadayken 2. space (suzulme), sonra fisek
+                if (jumpPhase == 0) {
+                    mc.options.sneakKey.setPressed(true);
+                    if (p.isOnGround()) {
+                        mc.options.jumpKey.setPressed(true);
+                        jumpPhase = 1;
+                    }
+                } else if (jumpPhase == 1) {
+                    if (!p.isOnGround()) {
+                        mc.options.jumpKey.setPressed(false);
+                        jumpPhase = 2;
+                    }
+                } else if (jumpPhase == 2) {
+                    mc.options.sneakKey.setPressed(false);
                     mc.options.jumpKey.setPressed(true);
+                    p.networkHandler.sendPacket(new ClientCommandC2SPacket(p, ClientCommandC2SPacket.Mode.START_FALL_FLYING));
+                    jumpPhase = 3;
                 } else {
                     mc.options.jumpKey.setPressed(false);
-                    mc.options.sneakKey.setPressed(false);
-                    p.networkHandler.sendPacket(new ClientCommandC2SPacket(p, ClientCommandC2SPacket.Mode.START_FALL_FLYING));
                     fireRocket(mc, p);
                     state = State.APPROACH;
                 }
             }
-            case ROCKET -> {
-                fireRocket(mc, p);
-                state = State.APPROACH;
-            }
             case APPROACH -> {
+                // Bu asamada vurma yok
                 if (canReach(p, target)) {
-                    targetCell = target.getBlockPos();
-                    pushDir = findPushDir(mc, targetCell, p);
-                    state = State.STRIKE;
+                    state = State.ENTER_TIGHT;
+                    enterStart = now;
+                    timer = 0;
+                    limit = swapTicks + 20;
+                    tightCell = null;
                     return;
                 }
                 double dist = reachDist(p, target);
@@ -168,24 +200,59 @@ public class ViewModelMod implements ClientModInitializer {
                 }
                 if (rocketCooldown == 0 && dist > 4) fireRocket(mc, p);
             }
+            case ENTER_TIGHT -> {
+                // Henuz vurma yok: once 1 blokluk alana gec
+                if (headroom(mc, p.getBlockPos()) == 1 && canReach(p, target)) {
+                    state = State.STRIKE;
+                    timer = 0;
+                    limit = 40;
+                    return;
+                }
+                if (tightCell == null) tightCell = findTightCell(mc, target.getBlockPos(), p);
+                if (tightCell == null) {
+                    info("Rakibin yaninda 1 blokluk bos hucre yok.");
+                    cooldown = 40;
+                    finish(p);
+                    return;
+                }
+                moveToCell(p, tightCell);
+            }
             case STRIKE -> {
-                if (pushDir != null && swapStart >= 0 && !target.getBlockPos().equals(targetCell)) {
-                    state = State.ENTER;
-                    enterStep(p);
+                // Rakip 2 blokluk alana gittiyse bitti
+                if (headroom(mc, target.getBlockPos()) >= 2) {
+                    info("§6[⚔ ViewModel] §fRakip 2 blokluk alana gonderildi.");
+                    finish(p);
+                    return;
+                }
+                if (!canReach(p, target)) { finish(p); return; }
+                // Sadece 1 blokluk alandayken vur
+                if (headroom(mc, p.getBlockPos()) != 1) {
+                    state = State.ENTER_TIGHT;
+                    enterStart = now;
+                    timer = 0;
+                    limit = swapTicks + 20;
+                    tightCell = null;
+                    return;
+                }
+                if (hits >= MAX_HITS) { finish(p); return; }
+                if (inWeb(mc, p)) return;
+
+                int best = findBestSweepingSlot(mc, p);
+                if (best < 0) {
+                    info("Hotbarda Savurma buyulu item yok, vurmuyorum.");
+                    cooldown = 40;
+                    finish(p);
+                    return;
+                }
+                if (p.getInventory().getSelectedSlot() != best) {
+                    p.getInventory().setSelectedSlot(best);
                     return;
                 }
                 if (now - lastHit < HIT_INTERVAL) return;
 
-                int best = findBestSweepingSlot(mc, p);
-                if (best >= 0 && p.getInventory().getSelectedSlot() != best) {
-                    p.getInventory().setSelectedSlot(best);
-                }
-
-                Vec3d back = pushDir != null ? pushDir : origin.subtract(pos(p));
-                if (back.horizontalLength() < 0.5) back = pos(target).subtract(pos(p));
-                float yaw = (float) (Math.toDegrees(Math.atan2(-back.x, back.z)));
-                float pitch = 0f;
-                sendLook(p, yaw, pitch);
+                Vec3d dir = findPushOut(mc, target.getBlockPos(), p);
+                float yaw = (float) (Math.toDegrees(Math.atan2(-dir.x, dir.z)));
+                sendLook(p, yaw, 0f);
 
                 mc.interactionManager.attackEntity(p, target);
                 p.swingHand(Hand.MAIN_HAND);
@@ -193,47 +260,15 @@ public class ViewModelMod implements ClientModInitializer {
                 lastHit = now;
 
                 sendLook(p, p.getYaw(), p.getPitch());
-
-                if (pushDir != null) {
-                    if (swapStart < 0) {
-                        swapStart = now;
-                        timer = 0;
-                        limit = swapTicks + 20;
-                    }
-                    state = State.ENTER;
-                    enterStep(p);
-                } else {
-                    state = State.LAND;
-                    timer = limit - 10;
-                }
-            }
-            case ENTER -> enterStep(p);
-            case LAND -> {
-                if (headroom(mc, p.getBlockPos()) == 1) {
-                    info("§6[⚔ ViewModel] §f1 blokluk alana gecildi, durdu.");
-                    finish(p);
-                } else if (p.isOnGround()) {
-                    finish(p);
-                }
             }
             default -> {}
         }
     }
 
-    private void enterStep(ClientPlayerEntity p) {
-        MinecraftClient mc = MinecraftClient.getInstance();
-        if (target != null && target.isAlive() && hits < MAX_HITS
-                && target.getBlockPos().equals(targetCell) && canReach(p, target)) {
-            state = State.STRIKE;
-            return;
-        }
-        if (p.getBlockPos().equals(targetCell) && headroom(mc, targetCell) == 1) {
-            info("§6[⚔ ViewModel] §f1 blokluk alana gecildi, durdu. (" + (now - swapStart) + " tick)");
-            finish(p); return;
-        }
-        Vec3d d = Vec3d.ofBottomCenter(targetCell).subtract(pos(p));
+    private void moveToCell(ClientPlayerEntity p, BlockPos cell) {
+        Vec3d d = Vec3d.ofBottomCenter(cell).subtract(pos(p));
         double dist = Math.hypot(d.x, d.z);
-        int remaining = Math.max(3, swapStart + swapTicks - now);
+        int remaining = Math.max(3, enterStart + swapTicks - now);
         double speed = Math.max(0.05, Math.min(0.2, dist / remaining));
         Vec3d v = new Vec3d(d.x, 0, d.z);
         if (v.lengthSquared() > 1.0E-4) v = v.normalize().multiply(speed);
@@ -263,6 +298,12 @@ public class ViewModelMod implements ClientModInitializer {
                 yaw, pitch, p.isOnGround(), p.horizontalCollision));
     }
 
+    private boolean inWeb(MinecraftClient mc, ClientPlayerEntity p) {
+        BlockPos feet = p.getBlockPos();
+        return mc.world.getBlockState(feet).isOf(Blocks.COBWEB)
+                || mc.world.getBlockState(feet.up()).isOf(Blocks.COBWEB);
+    }
+
     private int findBestSweepingSlot(MinecraftClient mc, ClientPlayerEntity p) {
         RegistryEntry<Enchantment> sweep = mc.world.getRegistryManager()
                 .getOrThrow(RegistryKeys.ENCHANTMENT).getOrThrow(Enchantments.SWEEPING_EDGE);
@@ -282,6 +323,7 @@ public class ViewModelMod implements ClientModInitializer {
         return -1;
     }
 
+    /** Ayaktan yukari kac blok gecilebilir (hava, ag, dugme...). Kati blok = tavan. */
     private int headroom(MinecraftClient mc, BlockPos feet) {
         int n = 0;
         for (int i = 0; i < 3; i++) {
@@ -303,25 +345,40 @@ public class ViewModelMod implements ClientModInitializer {
         return best;
     }
 
-    private Vec3d findPushDir(MinecraftClient mc, BlockPos cell, ClientPlayerEntity p) {
+    /** Rakibin hucresinin yanindaki, bize en yakin 1 blokluk bos hucre. */
+    private BlockPos findTightCell(MinecraftClient mc, BlockPos targetPos, ClientPlayerEntity p) {
+        BlockPos best = null;
+        double bd = 1e9;
+        for (Direction d : Direction.Type.HORIZONTAL) {
+            BlockPos n = targetPos.offset(d);
+            if (headroom(mc, n) != 1) continue;
+            double dist = pos(p).squaredDistanceTo(Vec3d.ofBottomCenter(n));
+            if (dist < bd) { bd = dist; best = n; }
+        }
+        return best;
+    }
+
+    /** Rakibi 2 blokluk (ag olan) tarafa atacak yon. */
+    private Vec3d findPushOut(MinecraftClient mc, BlockPos cell, ClientPlayerEntity p) {
         Direction bestDir = null;
         boolean bestHasWeb = false;
-        double bestDist = 1e9;
+        double bestDist = -1;
         for (Direction d : Direction.Type.HORIZONTAL) {
             BlockPos n = cell.offset(d);
             if (headroom(mc, n) < 2) continue;
             boolean web = false;
             for (int i = 0; i <= 3; i++) {
-                if (mc.world.getBlockState(n.up(i)).isOf(net.minecraft.block.Blocks.COBWEB)) { web = true; break; }
+                if (mc.world.getBlockState(n.up(i)).isOf(Blocks.COBWEB)) { web = true; break; }
             }
             double dist = pos(p).squaredDistanceTo(Vec3d.ofBottomCenter(n));
-            if ((web && !bestHasWeb) || (web == bestHasWeb && dist < bestDist)) {
+            if ((web && !bestHasWeb) || (web == bestHasWeb && dist > bestDist)) {
                 bestDir = d; bestHasWeb = web; bestDist = dist;
             }
         }
         if (bestDir == null) {
-            Vec3d v = pos(p).subtract(Vec3d.ofBottomCenter(cell));
-            return new Vec3d(v.x, 0, v.z).normalize();
+            Vec3d v = pos(target).subtract(pos(p));
+            Vec3d h = new Vec3d(v.x, 0, v.z);
+            return h.lengthSquared() < 1.0E-4 ? new Vec3d(0, 0, 1) : h.normalize();
         }
         return new Vec3d(bestDir.getOffsetX(), 0, bestDir.getOffsetZ());
     }
@@ -343,16 +400,17 @@ public class ViewModelMod implements ClientModInitializer {
         MinecraftClient mc = MinecraftClient.getInstance();
         mc.options.jumpKey.setPressed(false);
         mc.options.sneakKey.setPressed(false);
-        cooldown = (mc.player != null && headroom(mc, mc.player.getBlockPos()) == 1) ? 3 : 0;
+        if (cooldown < 3) cooldown = 3;
         if (p != null && prevSlot >= 0 && p.getInventory().getSelectedSlot() != prevSlot) {
-            p.getInventory().setSelectedSlot(prevSlot);
+            restoreSlot = prevSlot;
+            restoreAt = now + RESTORE_DELAY;
         }
         reset();
     }
 
     private void reset() {
-        hits = 0; pushDir = null; targetCell = null;
-        swapStart = -1; limit = TIMEOUT; lastHit = -999;
+        hits = 0; tightCell = null; jumpPhase = 0;
+        lastHit = -999; limit = TIMEOUT;
         state = State.IDLE; target = null; prevSlot = -1; timer = 0;
     }
 
