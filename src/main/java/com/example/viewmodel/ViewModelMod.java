@@ -7,17 +7,12 @@ import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.util.InputUtil;
-import net.minecraft.enchantment.Enchantment;
-import net.minecraft.enchantment.EnchantmentHelper;
-import net.minecraft.enchantment.Enchantments;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Items;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
-import net.minecraft.registry.RegistryKeys;
-import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
 import net.minecraft.util.math.BlockPos;
@@ -33,6 +28,7 @@ public class ViewModelMod implements ClientModInitializer {
     private static boolean enabled = false;
     private static int bindKey = InputUtil.GLFW_KEY_G;
     private static boolean keyWasDown = false;
+    private static String forcedName = null;
 
     private State state = State.IDLE;
     private PlayerEntity target;
@@ -55,7 +51,7 @@ public class ViewModelMod implements ClientModInitializer {
     private int restoreAt = 0;
 
     private static final double REACH = 3.0;
-    private static final double TIGHT_MAX = 1.7;   // bundan dusuk = 1 blokluk (sikisik) alan
+    private static final double TIGHT_MAX = 1.7;
     private static final int TIMEOUT = 60;
     private static final int MAX_HITS = 4;
     private static final int HIT_INTERVAL = 5;
@@ -83,8 +79,19 @@ public class ViewModelMod implements ClientModInitializer {
                 } catch (Exception e) {
                     info("Gecersiz sure. Ornek: .viewmodel time 1.5");
                 }
+            } else if (a.length >= 3 && a[1].equalsIgnoreCase("target")) {
+                if (a[2].equalsIgnoreCase("off")) {
+                    forcedName = null;
+                    info("Elle hedef kapatildi.");
+                } else {
+                    forcedName = a[2];
+                    info("Hedef: " + forcedName);
+                }
             } else if (a.length >= 2 && a[1].equalsIgnoreCase("scan")) {
-                if (mc.player != null && mc.world != null) info(analyze(mc, mc.player));
+                if (mc.player != null && mc.world != null) {
+                    info(analyze(mc, mc.player));
+                    info(hotbarReport(mc.player));
+                }
             } else {
                 toggle();
             }
@@ -125,17 +132,17 @@ public class ViewModelMod implements ClientModInitializer {
 
         if (state == State.IDLE) {
             if (cooldown > 0 || restoreSlot >= 0) return;
-            target = findTightTarget(mc, p);
+            target = findTarget(mc, p);
             if (target == null) {
                 if (diagCd == 0) { info(analyze(mc, p)); diagCd = 60; }
                 return;
             }
 
-            double ownFree = freeH(mc, p);
+            boolean ownTight = tight(mc, p);
             boolean reach = canReach(p, target);
 
             if (!reach) {
-                if (ownFree < TIGHT_MAX) {
+                if (ownTight) {
                     if (diagCd == 0) { info("Sen sikisik alandasin ama rakip uzakta (" + r1(reachDist(p, target)) + " blok), yaklasma yok."); diagCd = 60; }
                     target = null; return;
                 }
@@ -155,7 +162,7 @@ public class ViewModelMod implements ClientModInitializer {
             hits = 0;
             tightCell = null;
 
-            if (reach && ownFree < TIGHT_MAX) {
+            if (reach && ownTight) {
                 state = State.STRIKE; limit = 40;
             } else if (reach) {
                 state = State.ENTER_TIGHT; enterStart = now; limit = swapTicks + 20;
@@ -163,7 +170,7 @@ public class ViewModelMod implements ClientModInitializer {
                 state = State.PREP; limit = TIMEOUT;
             }
             info("Analiz: rakip " + target.getName().getString() + ", mesafe " + r1(reachDist(p, target))
-                    + ", rakip alan " + r1(freeH(mc, target)) + ", senin alanin " + r1(ownFree) + " -> " + state);
+                    + ", rakip alan " + r1(freeH(mc, target)) + ", senin alanin " + r1(freeH(mc, p)) + " -> " + state);
         }
 
         if (target == null || !target.isAlive() || ++timer > limit) { finish(p); return; }
@@ -191,6 +198,7 @@ public class ViewModelMod implements ClientModInitializer {
                 }
             }
             case APPROACH -> {
+                // Bu asamada vurma yok, sadece fisek
                 if (canReach(p, target)) {
                     state = State.ENTER_TIGHT;
                     enterStart = now;
@@ -212,7 +220,7 @@ public class ViewModelMod implements ClientModInitializer {
             }
             case ENTER_TIGHT -> {
                 // Henuz vurma yok: once 1 blokluk alana gec
-                if (freeH(mc, p) < TIGHT_MAX && canReach(p, target)) {
+                if (tight(mc, p) && canReach(p, target)) {
                     state = State.STRIKE;
                     timer = 0;
                     limit = 40;
@@ -225,20 +233,19 @@ public class ViewModelMod implements ClientModInitializer {
                     finish(p);
                     return;
                 }
-                // Hala suzuluyorsak fisekle hucreye yonel
                 if (p.isGliding() && rocketCooldown == 0) fireRocket(mc, p);
                 moveToCell(p, tightCell);
             }
             case STRIKE -> {
                 // Rakip 2 blokluk alana gittiyse bitti
-                if (freeH(mc, target) >= TIGHT_MAX) {
+                if (!tight(mc, target)) {
                     info("§6[⚔ ViewModel] §fRakip 2 blokluk alana gonderildi.");
                     finish(p);
                     return;
                 }
                 if (!canReach(p, target)) { finish(p); return; }
                 // Sadece 1 blokluk alandayken vur
-                if (freeH(mc, p) >= TIGHT_MAX) {
+                if (!tight(mc, p)) {
                     state = State.ENTER_TIGHT;
                     enterStart = now;
                     timer = 0;
@@ -249,9 +256,9 @@ public class ViewModelMod implements ClientModInitializer {
                 if (hits >= MAX_HITS) { finish(p); return; }
                 if (inWeb(mc, p)) return;
 
-                int best = findBestSweepingSlot(mc, p);
+                int best = findBestSweepingSlot(p);
                 if (best < 0) {
-                    info("Hotbarda Savurma buyulu item yok, vurmuyorum.");
+                    info("Hotbarda Savurma buyulu item yok. '.viewmodel scan' ile hotbar buyulerine bak.");
                     cooldown = 40;
                     finish(p);
                     return;
@@ -293,7 +300,6 @@ public class ViewModelMod implements ClientModInitializer {
         if (slot < 0) return;
         if (p.getInventory().getSelectedSlot() != slot) p.getInventory().setSelectedSlot(slot);
 
-        // Rakibin hitbox merkezine nisan
         Vec3d aim = target.getBoundingBox().getCenter();
         Vec3d d = aim.subtract(p.getEyePos());
         float yaw = (float) Math.toDegrees(Math.atan2(-d.x, d.z));
@@ -317,17 +323,43 @@ public class ViewModelMod implements ClientModInitializer {
                 || mc.world.getBlockState(feet.up()).isOf(Blocks.COBWEB);
     }
 
-    private int findBestSweepingSlot(MinecraftClient mc, ClientPlayerEntity p) {
-        RegistryEntry<Enchantment> sweep = mc.world.getRegistryManager()
-                .getOrThrow(RegistryKeys.ENCHANTMENT).getOrThrow(Enchantments.SWEEPING_EDGE);
-        int best = -1, bestLvl = -1;
+    // ---- Savurma buyusu: tum buyuleri oku, adinda "sweeping" gecen ----
+    private int sweepLevel(ItemStack s) {
+        if (s.isEmpty()) return 0;
+        int lvl = 0;
+        for (var e : s.getEnchantments().getEnchantmentEntries()) {
+            String id = e.getKey().getIdAsString();
+            if (id.contains("sweeping")) lvl = Math.max(lvl, e.getIntValue());
+        }
+        return lvl;
+    }
+
+    private int findBestSweepingSlot(ClientPlayerEntity p) {
+        int best = -1, bestLvl = 0;
+        for (int i = 0; i < 9; i++) {
+            int lvl = sweepLevel(p.getInventory().getStack(i));
+            if (lvl > bestLvl) { bestLvl = lvl; best = i; }
+        }
+        return best;
+    }
+
+    private String hotbarReport(ClientPlayerEntity p) {
+        StringBuilder sb = new StringBuilder("Hotbar: ");
+        boolean any = false;
         for (int i = 0; i < 9; i++) {
             ItemStack s = p.getInventory().getStack(i);
             if (s.isEmpty()) continue;
-            int lvl = EnchantmentHelper.getLevel(sweep, s);
-            if (lvl > bestLvl) { bestLvl = lvl; best = i; }
+            StringBuilder en = new StringBuilder();
+            for (var e : s.getEnchantments().getEnchantmentEntries()) {
+                en.append(e.getKey().getIdAsString().replace("minecraft:", "")).append(' ').append(e.getIntValue()).append(' ');
+            }
+            if (en.length() > 0) {
+                sb.append("[").append(i + 1).append(": ").append(en.toString().trim()).append("] ");
+                any = true;
+            }
         }
-        return bestLvl > 0 ? best : -1;
+        if (!any) sb.append("hicbir itemde buyu gorunmuyor.");
+        return sb.toString();
     }
 
     private int findSlot(ClientPlayerEntity p, net.minecraft.item.Item item) {
@@ -336,7 +368,7 @@ public class ViewModelMod implements ClientModInitializer {
         return -1;
     }
 
-    /** Verilen noktadan yukari, ilk tavana kadar serbest yukseklik (blok). Max 3. */
+    // ---- Alan olcumu (orumcek agi gecilebilir sayilir, kati blok tavan) ----
     private double freeHeightAt(MinecraftClient mc, double x, double y, double z) {
         BlockPos base = BlockPos.ofFloored(x, y + 0.01, z);
         for (int i = 0; i < 4; i++) {
@@ -345,7 +377,7 @@ public class ViewModelMod implements ClientModInitializer {
             if (sh.isEmpty()) continue;
             double top = b.getY() + sh.getMax(Direction.Axis.Y);
             double bottom = b.getY() + sh.getMin(Direction.Axis.Y);
-            if (top <= y + 0.05) continue; // ayagin altindaki zemin
+            if (top <= y + 0.05) continue;
             return Math.max(0, bottom - y);
         }
         return 3.0;
@@ -355,19 +387,26 @@ public class ViewModelMod implements ClientModInitializer {
         return freeHeightAt(mc, e.getX(), e.getY(), e.getZ());
     }
 
-    private PlayerEntity findTightTarget(MinecraftClient mc, ClientPlayerEntity p) {
-        PlayerEntity best = null; double bd = 900;
+    /** Sikisik (1 blokluk) mi: hitbox 1 bloktan kisa (emekleme/yuzme) VEYA tavan 1.7'den alcak. */
+    private boolean tight(MinecraftClient mc, Entity e) {
+        return e.getBoundingBox().getLengthY() < 1.0 || freeH(mc, e) < TIGHT_MAX;
+    }
+
+    private PlayerEntity findTarget(MinecraftClient mc, ClientPlayerEntity p) {
+        PlayerEntity best = null; double bd = 3600;
         for (PlayerEntity o : mc.world.getPlayers()) {
             if (o == p) continue;
+            if (forcedName != null) {
+                if (o.getName().getString().equalsIgnoreCase(forcedName)) return o;
+                continue;
+            }
             double d = p.squaredDistanceTo(o);
-            if (d > bd) continue;
-            double f = freeH(mc, o);
-            if (f >= 0.5 && f < TIGHT_MAX) { best = o; bd = d; }
+            if (d > 900 || d > bd) continue;
+            if (tight(mc, o)) { best = o; bd = d; }
         }
         return best;
     }
 
-    /** Rakibin hucresinin yanindaki, 1 blokluk bos hucre (bize en yakin). */
     private BlockPos findTightCell(MinecraftClient mc, PlayerEntity t, ClientPlayerEntity p) {
         BlockPos best = null;
         double bd = 1e9;
@@ -382,7 +421,6 @@ public class ViewModelMod implements ClientModInitializer {
         return best;
     }
 
-    /** Rakibi 2 blokluk (ag olan) tarafa atacak yon. */
     private Vec3d findPushOut(MinecraftClient mc, PlayerEntity t, ClientPlayerEntity p) {
         Direction bestDir = null;
         boolean bestHasWeb = false;
@@ -409,7 +447,6 @@ public class ViewModelMod implements ClientModInitializer {
         return new Vec3d(bestDir.getOffsetX(), 0, bestDir.getOffsetZ());
     }
 
-    /** Anlik durum analizi: neden calismadigini veya ne yapacagini yazar. */
     private String analyze(MinecraftClient mc, ClientPlayerEntity p) {
         PlayerEntity near = null; double bd = 1e9;
         for (PlayerEntity o : mc.world.getPlayers()) {
@@ -417,14 +454,13 @@ public class ViewModelMod implements ClientModInitializer {
             double d = p.squaredDistanceTo(o);
             if (d < bd) { bd = d; near = o; }
         }
-        if (near == null) return "Analiz: rakip yok, yakinda baska oyuncu gorunmuyor.";
-        double rf = freeH(mc, near), of = freeH(mc, p);
+        if (near == null) return "Analiz: yakinda baska oyuncu gorunmuyor.";
         String s = "Analiz: " + near.getName().getString() + " mesafe " + r1(reachDist(p, near))
-                + " blok, rakip alan " + r1(rf) + ", senin alanin " + r1(of) + " -> ";
+                + " blok, rakip alan " + r1(freeH(mc, near)) + " (hitbox " + r1(near.getBoundingBox().getLengthY())
+                + "), senin alanin " + r1(freeH(mc, p)) + " -> ";
         if (bd > 900) return s + "30 blokten uzak.";
-        if (rf >= TIGHT_MAX) return s + "rakip 2 blokluk alanda, sikisik degil.";
-        if (rf < 0.5) return s + "rakibin alani olculemedi (yarim blok/karisik sekil).";
-        if (canReach(p, near)) return s + (of < TIGHT_MAX ? "vurus modu." : "1 bloga girme modu.");
+        if (!tight(mc, near)) return s + "rakip sikisik degil (2 blokluk alan).";
+        if (canReach(p, near)) return s + (tight(mc, p) ? "vurus modu." : "1 bloga girme modu.");
         return s + "suzulerek yaklasma modu (elytra ve fisek gerekir).";
     }
 
