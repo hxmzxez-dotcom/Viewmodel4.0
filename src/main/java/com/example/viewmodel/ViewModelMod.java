@@ -15,15 +15,20 @@ import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
 import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.shape.VoxelShape;
+import net.minecraft.world.RaycastContext;
+
+import java.util.ArrayList;
+import java.util.List;
 
 public class ViewModelMod implements ClientModInitializer {
 
-    enum State { IDLE, PREP, APPROACH, ENTER_TIGHT, STRIKE }
+    enum State { IDLE, PREP, APPROACH, STRIKE }
 
     private static boolean enabled = false;
     private static int bindKey = InputUtil.GLFW_KEY_G;
@@ -34,7 +39,7 @@ public class ViewModelMod implements ClientModInitializer {
     private PlayerEntity target;
     private int prevSlot = -1;
     private int timer = 0;
-    private int limit = 60;
+    private int limit = 70;
     private int rocketCooldown = 0;
     private double lastDist = 999;
     private BlockPos tightCell;
@@ -43,19 +48,25 @@ public class ViewModelMod implements ClientModInitializer {
     private int diagCd = 0;
 
     private int now = 0;
-    private int swapTicks = 38;
-    private int enterStart = 0;
     private int lastHit = -999;
 
     private int restoreSlot = -1;
     private int restoreAt = 0;
 
+    private int webTicks = 0;
+    private int noMove = 0;
+    private Vec3d lastTargetPos = null;
+    private int tries = 0;
+    private int noLos = 0;
+
     private static final double REACH = 3.0;
     private static final double TIGHT_MAX = 1.7;
-    private static final int TIMEOUT = 60;
-    private static final int MAX_HITS = 4;
-    private static final int HIT_INTERVAL = 5;
+    private static final int TIMEOUT = 70;
+    private static final int MAX_HITS = 30;
+    private static final int HIT_INTERVAL = 6;   // 0.3 sn
+    private static final int SPACE_INTERVAL = 6; // 0.3 sn
     private static final int RESTORE_DELAY = 8;
+    private static final int SWEEP_SLOT = 1;     // 2. slot
 
     @Override
     public void onInitializeClient() {
@@ -69,15 +80,6 @@ public class ViewModelMod implements ClientModInitializer {
                     info("Tus atandi: " + a[2].toUpperCase());
                 } catch (Exception e) {
                     info("Gecersiz tus: " + a[2]);
-                }
-            } else if (a.length >= 3 && a[1].equalsIgnoreCase("time")) {
-                try {
-                    double sec = Double.parseDouble(a[2].replace(',', '.'));
-                    sec = Math.max(0.5, Math.min(5.0, sec));
-                    swapTicks = (int) Math.round(sec * 20);
-                    info("1 bloga girme suresi: " + sec + " sn (" + swapTicks + " tick)");
-                } catch (Exception e) {
-                    info("Gecersiz sure. Ornek: .viewmodel time 1.5");
                 }
             } else if (a.length >= 3 && a[1].equalsIgnoreCase("target")) {
                 if (a[2].equalsIgnoreCase("off")) {
@@ -140,36 +142,37 @@ public class ViewModelMod implements ClientModInitializer {
 
             boolean ownTight = tight(mc, p);
             boolean reach = canReach(p, target);
+            double dist = reachDist(p, target);
 
-            if (!reach) {
-                if (ownTight) {
-                    if (diagCd == 0) { info("Sen sikisik alandasin ama rakip uzakta (" + r1(reachDist(p, target)) + " blok), yaklasma yok."); diagCd = 60; }
+            State next;
+            if (ownTight) {
+                if (reach) next = State.STRIKE;
+                else {
+                    if (diagCd == 0) { info("Sen sikisik alandasin, rakip erisim disinda (" + r1(dist) + " blok)."); diagCd = 60; }
                     target = null; return;
                 }
-                if (p.getEquippedStack(net.minecraft.entity.EquipmentSlot.CHEST).getItem() != Items.ELYTRA) {
-                    if (diagCd == 0) { info("Elytra takili degil."); diagCd = 60; }
+            } else {
+                String why = glideProblem(p);
+                if (why != null) {
+                    if (diagCd == 0) { info(why); diagCd = 60; }
                     target = null; return;
                 }
-                if (findSlot(p, Items.FIREWORK_ROCKET) < 0) {
-                    if (diagCd == 0) { info("Hotbarda fisek yok."); diagCd = 60; }
-                    target = null; return;
-                }
+                next = State.PREP;
             }
 
             prevSlot = p.getInventory().getSelectedSlot();
             timer = 0;
             lastDist = 999;
             hits = 0;
+            noMove = 0;
+            noLos = 0;
+            lastTargetPos = null;
+            webTicks = 0;
             tightCell = null;
-
-            if (reach && ownTight) {
-                state = State.STRIKE; limit = 40;
-            } else if (reach) {
-                state = State.ENTER_TIGHT; enterStart = now; limit = swapTicks + 20;
-            } else {
-                state = State.PREP; limit = TIMEOUT;
-            }
-            info("Analiz: rakip " + target.getName().getString() + ", mesafe " + r1(reachDist(p, target))
+            tries = 0;
+            state = next;
+            limit = (next == State.STRIKE) ? 220 : TIMEOUT;
+            info("Analiz: rakip " + target.getName().getString() + ", mesafe " + r1(dist)
                     + ", rakip alan " + r1(freeH(mc, target)) + ", senin alanin " + r1(freeH(mc, p)) + " -> " + state);
         }
 
@@ -177,88 +180,108 @@ public class ViewModelMod implements ClientModInitializer {
 
         switch (state) {
             case PREP -> {
-                // Shift basili + space spam, suzulunceye kadar
+                // Shift basili, space 0.3 sn'de bir. Havada 2. space suzulmeyi acar.
                 mc.options.sneakKey.setPressed(true);
                 if (p.isGliding()) {
                     mc.options.jumpKey.setPressed(false);
                     mc.options.sneakKey.setPressed(false);
-                    fireRocket(mc, p);
                     state = State.APPROACH;
                     timer = 0;
+                    lastDist = 999;
+                    fireRocket(mc, p, aimPoint(mc, p));
                     return;
                 }
-                mc.options.jumpKey.setPressed(timer % 2 == 0);
-                if (timer == 14 && !p.isOnGround()) {
+                mc.options.jumpKey.setPressed(timer % SPACE_INTERVAL == 1);
+                if (timer >= 14 && timer % SPACE_INTERVAL == 3 && !p.isOnGround()) {
                     p.networkHandler.sendPacket(new ClientCommandC2SPacket(p, ClientCommandC2SPacket.Mode.START_FALL_FLYING));
                 }
-                if (timer > 25 && !p.isGliding()) {
-                    info("Suzulme baslamadi (elytra/ust blok/ag engel olabilir).");
-                    cooldown = 40;
+                if (timer > 40 && !p.isGliding()) {
+                    tries++;
+                    info("Suzulme baslamadi (deneme " + tries + "/3). Ag/ust blok/elytra engel olabilir.");
+                    cooldown = tries >= 3 ? 80 : 10;
+                    if (tries >= 3) tries = 0;
                     finish(p);
                 }
             }
             case APPROACH -> {
-                // Bu asamada vurma yok, sadece fisek
-                if (canReach(p, target)) {
-                    state = State.ENTER_TIGHT;
-                    enterStart = now;
+                // Bu asamada VURMA YOK, yurume yok: sadece fisek
+                boolean reach = canReach(p, target);
+                if (tight(mc, p) && reach) {
+                    state = State.STRIKE;
                     timer = 0;
-                    limit = swapTicks + 20;
-                    tightCell = null;
+                    limit = 220;
+                    return;
+                }
+                // Yere indiysek ve suzulmuyorsak tekrar suzul
+                if (p.isOnGround() && !p.isGliding() && timer > 6) {
+                    if (++tries > 3) {
+                        info("Fisek rakibin hucresine tasimadi, vazgeciyorum.");
+                        cooldown = 80;
+                        finish(p);
+                        return;
+                    }
+                    state = State.PREP;
+                    timer = 0;
+                    limit = TIMEOUT;
                     return;
                 }
                 double dist = reachDist(p, target);
-                if (p.horizontalCollision && timer > 8) { finish(p); return; }
-                if (timer > 10 && timer % 8 == 0) {
-                    if (lastDist - dist < 0.5) { finish(p); return; }
-                    lastDist = dist;
-                }
-                if (!p.isOnGround() && target.getY() < p.getY()) {
-                    p.addVelocity(0, -0.06, 0);
-                }
-                if (rocketCooldown == 0 && dist > 1.5) fireRocket(mc, p);
-            }
-            case ENTER_TIGHT -> {
-                // Henuz vurma yok: once 1 blokluk alana gec
-                if (tight(mc, p) && canReach(p, target)) {
-                    state = State.STRIKE;
-                    timer = 0;
-                    limit = 40;
-                    return;
-                }
-                if (tightCell == null) tightCell = findTightCell(mc, target, p);
-                if (tightCell == null) {
-                    info("Rakibin yaninda 1 blokluk bos hucre yok.");
-                    cooldown = 40;
+                if (!reach && p.horizontalCollision && timer > 8) {
+                    info("Suzulurken bir yere carptim, turu bitiriyorum.");
                     finish(p);
                     return;
                 }
-                if (p.isGliding() && rocketCooldown == 0) fireRocket(mc, p);
-                moveToCell(p, tightCell);
+                if (!reach && timer > 10 && timer % 8 == 0) {
+                    if (lastDist - dist < 0.5) { finish(p); return; }
+                    lastDist = dist;
+                }
+                if (rocketCooldown == 0) fireRocket(mc, p, aimPoint(mc, p));
             }
             case STRIKE -> {
-                // Rakip 2 blokluk alana gittiyse bitti
+                mc.options.jumpKey.setPressed(false);
+                mc.options.sneakKey.setPressed(false);
+
                 if (!tight(mc, target)) {
                     info("§6[⚔ ViewModel] §fRakip 2 blokluk alana gonderildi.");
                     finish(p);
                     return;
                 }
                 if (!canReach(p, target)) { finish(p); return; }
-                // Sadece 1 blokluk alandayken vur
+                // Biz sikisik alandan ciktiysak: tekrar suzulerek gir
                 if (!tight(mc, p)) {
-                    state = State.ENTER_TIGHT;
-                    enterStart = now;
+                    String why = glideProblem(p);
+                    if (why != null) { info(why); cooldown = 40; finish(p); return; }
+                    state = State.PREP;
                     timer = 0;
-                    limit = swapTicks + 20;
-                    tightCell = null;
+                    limit = TIMEOUT;
                     return;
                 }
-                if (hits >= MAX_HITS) { finish(p); return; }
-                if (inWeb(mc, p)) return;
+                if (hits >= MAX_HITS) {
+                    info("En fazla vurus sayisina ulasildi, rakip hala sikisik.");
+                    cooldown = 40;
+                    finish(p);
+                    return;
+                }
+                if (inWeb(mc, p)) {
+                    if (++webTicks > 15) { info("Ag icinde takildim, turu bitiriyorum."); finish(p); }
+                    return;
+                }
+                webTicks = 0;
 
-                int best = findBestSweepingSlot(p);
+                // Normal oyunda olmayacak vuruslari yapma
+                if (p.isTouchingWater() || p.isInLava()) return;
+                if (!clearShot(mc, p, target)) {
+                    if (++noLos > 20) {
+                        info("Rakibe acik hat yok (blok arada), turu bitiriyorum.");
+                        finish(p);
+                    }
+                    return;
+                }
+                noLos = 0;
+
+                int best = sweepSlot(p);
                 if (best < 0) {
-                    info("Hotbarda Savurma buyulu item yok. '.viewmodel scan' ile hotbar buyulerine bak.");
+                    info("2. slotta item yok ve Savurma buyulu item bulunamadi.");
                     cooldown = 40;
                     finish(p);
                     return;
@@ -269,38 +292,49 @@ public class ViewModelMod implements ClientModInitializer {
                 }
                 if (now - lastHit < HIT_INTERVAL) return;
 
-                Vec3d dir = findPushOut(mc, target, p);
+                Vec3d tp = pos(target);
+                if (lastTargetPos != null) {
+                    if (tp.distanceTo(lastTargetPos) < 0.05) noMove++; else noMove = 0;
+                }
+                List<Vec3d> cands = pushCandidates(mc, target, p);
+                int idx = (noMove / 3) % cands.size();
+                if (noMove > 0 && noMove % 3 == 0 && cands.size() > 1) {
+                    info("Rakip oynamiyor, yon degistiriyorum (" + (idx + 1) + "/" + cands.size() + ").");
+                }
+                Vec3d dir = cands.get(idx);
+
                 float yaw = (float) (Math.toDegrees(Math.atan2(-dir.x, dir.z)));
                 sendLook(p, yaw, 0f);
-
                 mc.interactionManager.attackEntity(p, target);
                 p.swingHand(Hand.MAIN_HAND);
                 hits++;
                 lastHit = now;
-
+                lastTargetPos = tp;
                 sendLook(p, p.getYaw(), p.getPitch());
             }
             default -> {}
         }
     }
 
-    private void moveToCell(ClientPlayerEntity p, BlockPos cell) {
-        Vec3d d = Vec3d.ofBottomCenter(cell).subtract(pos(p));
-        double dist = Math.hypot(d.x, d.z);
-        int remaining = Math.max(3, enterStart + swapTicks - now);
-        double speed = Math.max(0.05, Math.min(0.2, dist / remaining));
-        Vec3d v = new Vec3d(d.x, 0, d.z);
-        if (v.lengthSquared() > 1.0E-4) v = v.normalize().multiply(speed);
-        double vy = p.isOnGround() ? p.getVelocity().y : Math.min(p.getVelocity().y, 0) - 0.1;
-        p.setVelocity(v.x, vy, v.z);
+    /** Suzulme icin eksik sart varsa nedenini dondurur. */
+    private String glideProblem(ClientPlayerEntity p) {
+        if (p.getEquippedStack(net.minecraft.entity.EquipmentSlot.CHEST).getItem() != Items.ELYTRA) return "Elytra takili degil.";
+        if (findSlot(p, Items.FIREWORK_ROCKET) < 0) return "Hotbarda fisek yok.";
+        return null;
     }
 
-    private void fireRocket(MinecraftClient mc, ClientPlayerEntity p) {
+    /** Fisegin hedefi: rakibin yanindaki 1 blokluk hucrenin ortasi, yoksa rakibin hitbox merkezi. */
+    private Vec3d aimPoint(MinecraftClient mc, ClientPlayerEntity p) {
+        if (tightCell == null) tightCell = findTightCell(mc, target, p);
+        if (tightCell != null) return Vec3d.ofBottomCenter(tightCell).add(0, 0.5, 0);
+        return target.getBoundingBox().getCenter();
+    }
+
+    private void fireRocket(MinecraftClient mc, ClientPlayerEntity p, Vec3d aim) {
         int slot = findSlot(p, Items.FIREWORK_ROCKET);
         if (slot < 0) return;
         if (p.getInventory().getSelectedSlot() != slot) p.getInventory().setSelectedSlot(slot);
 
-        Vec3d aim = target.getBoundingBox().getCenter();
         Vec3d d = aim.subtract(p.getEyePos());
         float yaw = (float) Math.toDegrees(Math.atan2(-d.x, d.z));
         float pitch = (float) -Math.toDegrees(Math.atan2(d.y, Math.hypot(d.x, d.z)));
@@ -323,7 +357,20 @@ public class ViewModelMod implements ClientModInitializer {
                 || mc.world.getBlockState(feet.up()).isOf(Blocks.COBWEB);
     }
 
-    // ---- Savurma buyusu: tum buyuleri oku, adinda "sweeping" gecen ----
+    /** Goz ile rakibin hitbox'u arasinda kati blok var mi? (ag gecirgen sayilir) */
+    private boolean clearShot(MinecraftClient mc, ClientPlayerEntity p, PlayerEntity t) {
+        Vec3d e = p.getEyePos();
+        Box b = t.getBoundingBox();
+        Vec3d to = new Vec3d(
+                Math.max(b.minX, Math.min(e.x, b.maxX)),
+                Math.max(b.minY, Math.min(e.y, b.maxY)),
+                Math.max(b.minZ, Math.min(e.z, b.maxZ)));
+        var hit = mc.world.raycast(new RaycastContext(e, to,
+                RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, p));
+        return hit.getType() == HitResult.Type.MISS;
+    }
+
+    // ---- Savurma slotu: buyuyu algila, yoksa 2. slot ----
     private int sweepLevel(ItemStack s) {
         if (s.isEmpty()) return 0;
         int lvl = 0;
@@ -343,6 +390,14 @@ public class ViewModelMod implements ClientModInitializer {
         return best;
     }
 
+    private int sweepSlot(ClientPlayerEntity p) {
+        int best = findBestSweepingSlot(p);
+        if (best >= 0) return best;
+        ItemStack s = p.getInventory().getStack(SWEEP_SLOT);
+        if (!s.isEmpty() && !s.isOf(Items.FIREWORK_ROCKET)) return SWEEP_SLOT;
+        return -1;
+    }
+
     private String hotbarReport(ClientPlayerEntity p) {
         StringBuilder sb = new StringBuilder("Hotbar: ");
         boolean any = false;
@@ -358,7 +413,7 @@ public class ViewModelMod implements ClientModInitializer {
                 any = true;
             }
         }
-        if (!any) sb.append("hicbir itemde buyu gorunmuyor.");
+        if (!any) sb.append("hicbir itemde buyu gorunmuyor (2. slot yine de kullanilir).");
         return sb.toString();
     }
 
@@ -368,7 +423,7 @@ public class ViewModelMod implements ClientModInitializer {
         return -1;
     }
 
-    // ---- Alan olcumu (orumcek agi gecilebilir sayilir, kati blok tavan) ----
+    // ---- Alan olcumu (ag gecilebilir sayilir, kati blok tavan) ----
     private double freeHeightAt(MinecraftClient mc, double x, double y, double z) {
         BlockPos base = BlockPos.ofFloored(x, y + 0.01, z);
         for (int i = 0; i < 4; i++) {
@@ -387,7 +442,6 @@ public class ViewModelMod implements ClientModInitializer {
         return freeHeightAt(mc, e.getX(), e.getY(), e.getZ());
     }
 
-    /** Sikisik (1 blokluk) mi: hitbox 1 bloktan kisa (emekleme/yuzme) VEYA tavan 1.7'den alcak. */
     private boolean tight(MinecraftClient mc, Entity e) {
         return e.getBoundingBox().getLengthY() < 1.0 || freeH(mc, e) < TIGHT_MAX;
     }
@@ -421,10 +475,8 @@ public class ViewModelMod implements ClientModInitializer {
         return best;
     }
 
-    private Vec3d findPushOut(MinecraftClient mc, PlayerEntity t, ClientPlayerEntity p) {
-        Direction bestDir = null;
-        boolean bestHasWeb = false;
-        double bestDist = -1;
+    private List<Vec3d> pushCandidates(MinecraftClient mc, PlayerEntity t, ClientPlayerEntity p) {
+        List<double[]> tmp = new ArrayList<>();
         BlockPos tp = t.getBlockPos();
         for (Direction d : Direction.Type.HORIZONTAL) {
             BlockPos n = tp.offset(d);
@@ -434,17 +486,18 @@ public class ViewModelMod implements ClientModInitializer {
             for (int i = 0; i <= 3; i++) {
                 if (mc.world.getBlockState(n.up(i)).isOf(Blocks.COBWEB)) { web = true; break; }
             }
-            double dist = pos(p).squaredDistanceTo(Vec3d.ofBottomCenter(n));
-            if ((web && !bestHasWeb) || (web == bestHasWeb && dist > bestDist)) {
-                bestDir = d; bestHasWeb = web; bestDist = dist;
-            }
+            double dist = Math.sqrt(pos(p).squaredDistanceTo(Vec3d.ofBottomCenter(n)));
+            tmp.add(new double[]{(web ? 100 : 0) + dist, d.getOffsetX(), d.getOffsetZ()});
         }
-        if (bestDir == null) {
+        tmp.sort((a, b) -> Double.compare(b[0], a[0]));
+        List<Vec3d> out = new ArrayList<>();
+        for (double[] a : tmp) out.add(new Vec3d(a[1], 0, a[2]));
+        if (out.isEmpty()) {
             Vec3d v = pos(t).subtract(pos(p));
             Vec3d h = new Vec3d(v.x, 0, v.z);
-            return h.lengthSquared() < 1.0E-4 ? new Vec3d(0, 0, 1) : h.normalize();
+            out.add(h.lengthSquared() < 1.0E-4 ? new Vec3d(0, 0, 1) : h.normalize());
         }
-        return new Vec3d(bestDir.getOffsetX(), 0, bestDir.getOffsetZ());
+        return out;
     }
 
     private String analyze(MinecraftClient mc, ClientPlayerEntity p) {
@@ -460,8 +513,9 @@ public class ViewModelMod implements ClientModInitializer {
                 + "), senin alanin " + r1(freeH(mc, p)) + " -> ";
         if (bd > 900) return s + "30 blokten uzak.";
         if (!tight(mc, near)) return s + "rakip sikisik degil (2 blokluk alan).";
-        if (canReach(p, near)) return s + (tight(mc, p) ? "vurus modu." : "1 bloga girme modu.");
-        return s + "suzulerek yaklasma modu (elytra ve fisek gerekir).";
+        if (tight(mc, p)) return s + (canReach(p, near) ? "vurus modu." : "sen de sikisiksin, rakip erisim disinda.");
+        String why = glideProblem(p);
+        return s + (why != null ? why : "suzulme + fisek modu.");
     }
 
     private static double r1(double v) { return Math.round(v * 10.0) / 10.0; }
@@ -492,7 +546,8 @@ public class ViewModelMod implements ClientModInitializer {
     }
 
     private void reset() {
-        hits = 0; tightCell = null;
+        hits = 0; tightCell = null; noMove = 0; webTicks = 0; noLos = 0;
+        lastTargetPos = null;
         lastHit = -999; limit = TIMEOUT;
         state = State.IDLE; target = null; prevSlot = -1; timer = 0;
     }
