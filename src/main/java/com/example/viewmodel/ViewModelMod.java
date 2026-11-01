@@ -31,6 +31,7 @@ public class ViewModelMod implements ClientModInitializer {
     enum State { IDLE, PREP, APPROACH, STRIKE }
 
     private static boolean enabled = false;
+    private static boolean lookAssist = true;
     private static int bindKey = InputUtil.GLFW_KEY_G;
     private static boolean keyWasDown = false;
     private static String forcedName = null;
@@ -58,6 +59,9 @@ public class ViewModelMod implements ClientModInitializer {
     private Vec3d lastTargetPos = null;
     private int tries = 0;
     private int noLos = 0;
+
+    private boolean lookLocked = false;
+    private float origYaw, origPitch;
 
     private static final double REACH = 3.0;
     private static final double TIGHT_MAX = 1.7;
@@ -89,6 +93,9 @@ public class ViewModelMod implements ClientModInitializer {
                     forcedName = a[2];
                     info("Hedef: " + forcedName);
                 }
+            } else if (a.length >= 2 && a[1].equalsIgnoreCase("look")) {
+                lookAssist = !lookAssist;
+                info("Ucus sirasinda kamera hedefe donsun: " + (lookAssist ? "ACIK" : "KAPALI"));
             } else if (a.length >= 2 && a[1].equalsIgnoreCase("scan")) {
                 if (mc.player != null && mc.world != null) {
                     info(analyze(mc, mc.player));
@@ -105,7 +112,11 @@ public class ViewModelMod implements ClientModInitializer {
 
     private void toggle() {
         enabled = !enabled;
-        if (!enabled) reset();
+        if (!enabled) {
+            MinecraftClient mc = MinecraftClient.getInstance();
+            if (mc.player != null) restoreLook(mc.player);
+            reset();
+        }
         info("§6[⚔ ViewModel] §f" + (enabled ? "ACIK" : "KAPALI"));
     }
 
@@ -133,10 +144,11 @@ public class ViewModelMod implements ClientModInitializer {
         if (diagCd > 0) diagCd--;
 
         if (state == State.IDLE) {
-            if (cooldown > 0 || restoreSlot >= 0) return;
+            if (cooldown > 0 || restoreSlot >= 0) { hud(mc, p); return; }
             target = findTarget(mc, p);
             if (target == null) {
                 if (diagCd == 0) { info(analyze(mc, p)); diagCd = 60; }
+                hud(mc, p);
                 return;
             }
 
@@ -149,13 +161,13 @@ public class ViewModelMod implements ClientModInitializer {
                 if (reach) next = State.STRIKE;
                 else {
                     if (diagCd == 0) { info("Sen sikisik alandasin, rakip erisim disinda (" + r1(dist) + " blok)."); diagCd = 60; }
-                    target = null; return;
+                    target = null; hud(mc, p); return;
                 }
             } else {
                 String why = glideProblem(p);
                 if (why != null) {
                     if (diagCd == 0) { info(why); diagCd = 60; }
-                    target = null; return;
+                    target = null; hud(mc, p); return;
                 }
                 next = State.PREP;
             }
@@ -176,11 +188,11 @@ public class ViewModelMod implements ClientModInitializer {
                     + ", rakip alan " + r1(freeH(mc, target)) + ", senin alanin " + r1(freeH(mc, p)) + " -> " + state);
         }
 
-        if (target == null || !target.isAlive() || ++timer > limit) { finish(p); return; }
+        if (target == null || !target.isAlive() || ++timer > limit) { finish(p); hud(mc, p); return; }
 
         switch (state) {
             case PREP -> {
-                // Shift basili, space 0.3 sn'de bir. Havada 2. space suzulmeyi acar.
+                restoreLook(p);
                 mc.options.sneakKey.setPressed(true);
                 if (p.isGliding()) {
                     mc.options.jumpKey.setPressed(false);
@@ -188,8 +200,9 @@ public class ViewModelMod implements ClientModInitializer {
                     state = State.APPROACH;
                     timer = 0;
                     lastDist = 999;
+                    lookAtAim(mc, p);
                     fireRocket(mc, p, aimPoint(mc, p));
-                    return;
+                    break;
                 }
                 mc.options.jumpKey.setPressed(timer % SPACE_INTERVAL == 1);
                 if (timer >= 14 && timer % SPACE_INTERVAL == 3 && !p.isOnGround()) {
@@ -204,78 +217,81 @@ public class ViewModelMod implements ClientModInitializer {
                 }
             }
             case APPROACH -> {
-                // Bu asamada VURMA YOK, yurume yok: sadece fisek
                 boolean reach = canReach(p, target);
                 if (tight(mc, p) && reach) {
+                    restoreLook(p);
                     state = State.STRIKE;
                     timer = 0;
                     limit = 220;
-                    return;
+                    break;
                 }
-                // Yere indiysek ve suzulmuyorsak tekrar suzul
                 if (p.isOnGround() && !p.isGliding() && timer > 6) {
+                    restoreLook(p);
                     if (++tries > 3) {
                         info("Fisek rakibin hucresine tasimadi, vazgeciyorum.");
                         cooldown = 80;
                         finish(p);
-                        return;
+                        break;
                     }
                     state = State.PREP;
                     timer = 0;
                     limit = TIMEOUT;
-                    return;
+                    break;
                 }
                 double dist = reachDist(p, target);
                 if (!reach && p.horizontalCollision && timer > 8) {
                     info("Suzulurken bir yere carptim, turu bitiriyorum.");
                     finish(p);
-                    return;
+                    break;
                 }
                 if (!reach && timer > 10 && timer % 8 == 0) {
-                    if (lastDist - dist < 0.5) { finish(p); return; }
+                    if (lastDist - dist < 0.5) { finish(p); break; }
                     lastDist = dist;
                 }
-                if (rocketCooldown == 0) fireRocket(mc, p, aimPoint(mc, p));
+                lookAtAim(mc, p);
+                double speed = p.getVelocity().length();
+                if (rocketCooldown == 0 && (speed < 0.8 || dist > 6)) {
+                    fireRocket(mc, p, aimPoint(mc, p));
+                }
             }
             case STRIKE -> {
+                restoreLook(p);
                 mc.options.jumpKey.setPressed(false);
                 mc.options.sneakKey.setPressed(false);
 
                 if (!tight(mc, target)) {
                     info("§6[⚔ ViewModel] §fRakip 2 blokluk alana gonderildi.");
                     finish(p);
-                    return;
+                    break;
                 }
-                if (!canReach(p, target)) { finish(p); return; }
-                // Biz sikisik alandan ciktiysak: tekrar suzulerek gir
+                if (!canReach(p, target)) { finish(p); break; }
                 if (!tight(mc, p)) {
                     String why = glideProblem(p);
-                    if (why != null) { info(why); cooldown = 40; finish(p); return; }
+                    if (why != null) { info(why); cooldown = 40; finish(p); break; }
                     state = State.PREP;
                     timer = 0;
                     limit = TIMEOUT;
-                    return;
+                    break;
                 }
                 if (hits >= MAX_HITS) {
                     info("En fazla vurus sayisina ulasildi, rakip hala sikisik.");
                     cooldown = 40;
                     finish(p);
-                    return;
+                    break;
                 }
                 if (inWeb(mc, p)) {
                     if (++webTicks > 15) { info("Ag icinde takildim, turu bitiriyorum."); finish(p); }
-                    return;
+                    break;
                 }
                 webTicks = 0;
 
-                // Normal oyunda olmayacak vuruslari yapma
-                if (p.isTouchingWater() || p.isInLava()) return;
+                if (p.isTouchingWater() || p.isInLava()) break;
                 if (!clearShot(mc, p, target)) {
                     if (++noLos > 20) {
                         info("Rakibe acik hat yok (blok arada), turu bitiriyorum.");
                         finish(p);
                     }
-                    return;
+                    break;
                 }
                 noLos = 0;
 
@@ -284,13 +300,13 @@ public class ViewModelMod implements ClientModInitializer {
                     info("2. slotta item yok ve Savurma buyulu item bulunamadi.");
                     cooldown = 40;
                     finish(p);
-                    return;
+                    break;
                 }
                 if (p.getInventory().getSelectedSlot() != best) {
                     p.getInventory().setSelectedSlot(best);
-                    return;
+                    break;
                 }
-                if (now - lastHit < HIT_INTERVAL) return;
+                if (now - lastHit < HIT_INTERVAL) break;
 
                 Vec3d tp = pos(target);
                 if (lastTargetPos != null) {
@@ -314,16 +330,69 @@ public class ViewModelMod implements ClientModInitializer {
             }
             default -> {}
         }
+        hud(mc, p);
     }
 
-    /** Suzulme icin eksik sart varsa nedenini dondurur. */
+    // ---- HUD: onceden ne yapacagini gosterir ----
+    private void hud(MinecraftClient mc, ClientPlayerEntity p) {
+        String s;
+        switch (state) {
+            case PREP -> s = "§e1/4 Suzulme (shift + space spam)  §7Sonra: fisek → hucre → savurma";
+            case APPROACH -> {
+                double dist = target != null ? reachDist(p, target) : 0;
+                double sp = Math.max(0.05, p.getVelocity().length());
+                s = "§e2/4 Fisek  §fmesafe " + r1(dist) + "  hiz " + r1(sp)
+                        + "  tahmini " + (int) Math.ceil(dist / sp) + " tick  §7Hedef: "
+                        + (tightCell != null ? "1 blok hucre" : "rakip");
+            }
+            case STRIKE -> {
+                String dn = "?";
+                if (target != null) {
+                    List<Vec3d> c = pushCandidates(mc, target, p);
+                    Vec3d d = c.get(0);
+                    dn = Direction.getFacing(d.x, 0, d.z).asString();
+                }
+                s = "§c3/4 Savurma " + hits + "/" + MAX_HITS + "  §fyon: " + dn + "  §7Sonra: eski slot";
+            }
+            default -> {
+                PlayerEntity t = findTarget(mc, p);
+                s = t == null ? "§a⚔ bekliyor  §7hedef yok"
+                        : "§a⚔ bekliyor  §fhedef: " + t.getName().getString() + "  mesafe " + r1(reachDist(p, t))
+                        + "  alan " + r1(freeH(mc, t)) + "/" + r1(freeH(mc, p));
+            }
+        }
+        mc.inGameHud.setOverlayMessage(Text.literal(s), false);
+    }
+
+    // ---- Ucus sirasinda kamerayi hedefe cevir ----
+    private void lookAtAim(MinecraftClient mc, ClientPlayerEntity p) {
+        if (!lookAssist) return;
+        Vec3d d = aimPoint(mc, p).subtract(p.getEyePos());
+        float yaw = (float) Math.toDegrees(Math.atan2(-d.x, d.z));
+        float pitch = (float) -Math.toDegrees(Math.atan2(d.y, Math.hypot(d.x, d.z)));
+        if (!lookLocked) {
+            origYaw = p.getYaw();
+            origPitch = p.getPitch();
+            lookLocked = true;
+        }
+        p.setYaw(yaw);
+        p.setPitch(pitch);
+    }
+
+    private void restoreLook(ClientPlayerEntity p) {
+        if (lookLocked) {
+            p.setYaw(origYaw);
+            p.setPitch(origPitch);
+            lookLocked = false;
+        }
+    }
+
     private String glideProblem(ClientPlayerEntity p) {
         if (p.getEquippedStack(net.minecraft.entity.EquipmentSlot.CHEST).getItem() != Items.ELYTRA) return "Elytra takili degil.";
         if (findSlot(p, Items.FIREWORK_ROCKET) < 0) return "Hotbarda fisek yok.";
         return null;
     }
 
-    /** Fisegin hedefi: rakibin yanindaki 1 blokluk hucrenin ortasi, yoksa rakibin hitbox merkezi. */
     private Vec3d aimPoint(MinecraftClient mc, ClientPlayerEntity p) {
         if (tightCell == null) tightCell = findTightCell(mc, target, p);
         if (tightCell != null) return Vec3d.ofBottomCenter(tightCell).add(0, 0.5, 0);
@@ -335,15 +404,18 @@ public class ViewModelMod implements ClientModInitializer {
         if (slot < 0) return;
         if (p.getInventory().getSelectedSlot() != slot) p.getInventory().setSelectedSlot(slot);
 
-        Vec3d d = aim.subtract(p.getEyePos());
-        float yaw = (float) Math.toDegrees(Math.atan2(-d.x, d.z));
-        float pitch = (float) -Math.toDegrees(Math.atan2(d.y, Math.hypot(d.x, d.z)));
-
-        float oy = p.getYaw(), op = p.getPitch();
-        p.setYaw(yaw); p.setPitch(pitch);
-        mc.interactionManager.interactItem(p, Hand.MAIN_HAND);
-        p.setYaw(oy); p.setPitch(op);
-        rocketCooldown = 8;
+        if (lookLocked) {
+            mc.interactionManager.interactItem(p, Hand.MAIN_HAND);
+        } else {
+            Vec3d d = aim.subtract(p.getEyePos());
+            float yaw = (float) Math.toDegrees(Math.atan2(-d.x, d.z));
+            float pitch = (float) -Math.toDegrees(Math.atan2(d.y, Math.hypot(d.x, d.z)));
+            float oy = p.getYaw(), op = p.getPitch();
+            p.setYaw(yaw); p.setPitch(pitch);
+            mc.interactionManager.interactItem(p, Hand.MAIN_HAND);
+            p.setYaw(oy); p.setPitch(op);
+        }
+        rocketCooldown = 10;
     }
 
     private void sendLook(ClientPlayerEntity p, float yaw, float pitch) {
@@ -357,7 +429,6 @@ public class ViewModelMod implements ClientModInitializer {
                 || mc.world.getBlockState(feet.up()).isOf(Blocks.COBWEB);
     }
 
-    /** Goz ile rakibin hitbox'u arasinda kati blok var mi? (ag gecirgen sayilir) */
     private boolean clearShot(MinecraftClient mc, ClientPlayerEntity p, PlayerEntity t) {
         Vec3d e = p.getEyePos();
         Box b = t.getBoundingBox();
@@ -537,6 +608,7 @@ public class ViewModelMod implements ClientModInitializer {
         MinecraftClient mc = MinecraftClient.getInstance();
         mc.options.jumpKey.setPressed(false);
         mc.options.sneakKey.setPressed(false);
+        if (p != null) restoreLook(p);
         if (cooldown < 3) cooldown = 3;
         if (p != null && prevSlot >= 0 && p.getInventory().getSelectedSlot() != prevSlot) {
             restoreSlot = prevSlot;
@@ -547,7 +619,7 @@ public class ViewModelMod implements ClientModInitializer {
 
     private void reset() {
         hits = 0; tightCell = null; noMove = 0; webTicks = 0; noLos = 0;
-        lastTargetPos = null;
+        lastTargetPos = null; lookLocked = false;
         lastHit = -999; limit = TIMEOUT;
         state = State.IDLE; target = null; prevSlot = -1; timer = 0;
     }
